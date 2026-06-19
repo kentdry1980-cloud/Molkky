@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>モルックAR テスト</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; overflow: hidden;
+    width: 100%; height: 100%;
+    font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
+    background: #111;
+  }
+  #overlay {
+    position: fixed; top: 0; left: 0; width: 100%;
+    z-index: 10; pointer-events: none;
+    display: flex; flex-direction: column; align-items: center;
+  }
+  #status {
+    margin-top: 16px;
+    background: rgba(0,0,0,0.6);
+    color: #fff;
+    padding: 8px 16px;
+    border-radius: 20px;
+    font-size: 14px;
+    text-align: center;
+    max-width: 90%;
+  }
+  #score {
+    margin-top: 10px;
+    background: rgba(0,0,0,0.6);
+    color: #ffd700;
+    padding: 6px 14px;
+    border-radius: 16px;
+    font-size: 16px;
+    font-weight: bold;
+    text-align: center;
+  }
+  #lastThrow {
+    margin-top: 6px;
+    background: rgba(0,0,0,0.5);
+    color: #9fffb0;
+    padding: 4px 12px;
+    border-radius: 14px;
+    font-size: 13px;
+    min-height: 18px;
+  }
+  #startBtn {
+    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    z-index: 20;
+    background: #1a1a2e;
+    color: #fff;
+    border: none;
+    font-size: 18px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+  }
+  #startBtn button {
+    margin-top: 20px;
+    padding: 14px 32px;
+    font-size: 18px;
+    border-radius: 30px;
+    border: none;
+    background: #4CAF50;
+    color: white;
+    pointer-events: auto;
+  }
+  #resetBtn {
+    position: fixed; bottom: 24px; right: 16px;
+    z-index: 15;
+    padding: 10px 18px;
+    border-radius: 20px;
+    border: none;
+    background: rgba(255,80,80,0.85);
+    color: white;
+    font-size: 14px;
+    pointer-events: auto;
+  }
+  #unsupported {
+    color: #ff6b6b;
+    font-size: 13px;
+    margin-top: 10px;
+    max-width: 80%;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<div id="startBtn">
+  <div>モルックAR テスト</div>
+  <div style="font-size:13px; opacity:0.7; margin-top:6px;">対応端末: Android Chrome (WebXR対応)</div>
+  <button id="enterAR">ARを開始</button>
+  <div id="unsupported"></div>
+</div>
+
+<div id="overlay">
+  <div id="status">床をタップしてピンを配置してください</div>
+  <div id="score">合計スコア: 0 点</div>
+  <div id="lastThrow"></div>
+</div>
+
+<button id="resetBtn" style="display:none;">リセット</button>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { ARButton } from 'three/addons/webxr/ARButton.js';
+
+// ---------- 基本セットアップ ----------
+let camera, scene, renderer;
+let reticle; // 床検出用の照準
+let hitTestSource = null;
+let hitTestSourceRequested = false;
+
+let pinsPlaced = false;
+const pins = []; // {mesh, body:{pos, vel, angVel, knocked, baseQuat}}
+const PIN_COUNT = 12;
+const sticks = []; // 飛んでいる棒
+
+let score = 0;
+const statusEl = document.getElementById('status');
+const scoreEl = document.getElementById('score');
+const lastThrowEl = document.getElementById('lastThrow');
+const resetBtn = document.getElementById('resetBtn');
+
+init();
+
+function init() {
+  scene = new THREE.Scene();
+
+  camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+
+  const light = new THREE.HemisphereLight(0xffffff, 0x444444, 1.2);
+  light.position.set(0.5, 1, 0.25);
+  scene.add(light);
+  const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+  dirLight.position.set(0, 3, 1);
+  scene.add(dirLight);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.xr.enabled = true;
+  document.body.appendChild(renderer.domElement);
+
+  // 床検出の照準（リング）
+  reticle = new THREE.Mesh(
+    new THREE.RingGeometry(0.08, 0.1, 32).rotateX(-Math.PI / 2),
+    new THREE.MeshBasicMaterial({ color: 0x00ff00 })
+  );
+  reticle.matrixAutoUpdate = false;
+  reticle.visible = false;
+  scene.add(reticle);
+
+  // ---- ARボタン設定 ----
+  const sessionInit = {
+    requiredFeatures: ['hit-test'],
+    optionalFeatures: ['dom-overlay'],
+    domOverlay: { root: document.body }
+  };
+
+  document.getElementById('enterAR').addEventListener('click', () => {
+    if (!navigator.xr) {
+      document.getElementById('unsupported').textContent =
+        'このブラウザはWebXRに対応していません。Android Chromeでお試しください。';
+      return;
+    }
+    navigator.xr.isSessionSupported('immersive-ar').then((supported) => {
+      if (!supported) {
+        document.getElementById('unsupported').textContent =
+          'この端末はARモードに対応していません。';
+        return;
+      }
+      const arButton = ARButton.createButton(renderer, sessionInit);
+      arButton.style.display = 'none';
+      document.body.appendChild(arButton);
+      arButton.click();
+      document.getElementById('startBtn').style.display = 'none';
+      resetBtn.style.display = 'block';
+    });
+  });
+
+  renderer.xr.addEventListener('sessionstart', onSessionStart);
+  renderer.xr.addEventListener('sessionend', onSessionEnd);
+
+  window.addEventListener('resize', onWindowResize);
+
+  resetBtn.addEventListener('click', resetGame);
+
+  // タップでピン配置
+  const controller = renderer.xr.getController(0);
+  controller.addEventListener('select', onSelect);
+  scene.add(controller);
+
+  renderer.setAnimationLoop(render);
+}
+
+function onWindowResize() {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+function onSessionStart() {
+  statusEl.textContent = '床にカメラを向けてタップ → ピンを配置';
+  setupMotionListener();
+}
+
+function onSessionEnd() {
+  resetBtn.style.display = 'none';
+  document.getElementById('startBtn').style.display = 'flex';
+}
+
+// ---------- ピン配置 ----------
+function onSelect() {
+  if (pinsPlaced) return;
+  if (reticle.visible) {
+    placePins(reticle.matrix);
+  }
+}
+
+function placePins(matrix) {
+  const pos = new THREE.Vector3();
+  const quat = new THREE.Quaternion();
+  const scale = new THREE.Vector3();
+  matrix.decompose(pos, quat, scale);
+
+  // 公式モルック配列
+  // 最前列(プレイヤーに近い側): 1, 2
+  // 2列目: 3, 4
+  // 3列目: 5, 11, 12, 6
+  // 最後列(奥): 7, 8, 9
+  // z軸マイナス方向 = カメラ/プレイヤーから奥へ向かう方向として配置
+  const spacing = 0.075; // ピン間隔(メートル)
+  const rowDepth = 0.08; // 列同士の奥行き間隔
+
+  const layout = [
+    // [番号, x(横), row(奥行きインデックス)]
+    { num: 1,  x: -0.5 * spacing, row: 0 },
+    { num: 2,  x:  0.5 * spacing, row: 0 },
+
+    { num: 3,  x: -0.5 * spacing, row: 1 },
+    { num: 4,  x:  0.5 * spacing, row: 1 },
+
+    { num: 5,  x: -1.5 * spacing, row: 2 },
+    { num: 11, x: -0.5 * spacing, row: 2 },
+    { num: 12, x:  0.5 * spacing, row: 2 },
+    { num: 6,  x:  1.5 * spacing, row: 2 },
+
+    { num: 7,  x: -1.0 * spacing, row: 3 },
+    { num: 8,  x:  0.0,           row: 3 },
+    { num: 9,  x:  1.0 * spacing, row: 3 },
+
+    // 10番は最後列の中央奥(やや高得点ピンとして中心寄りに置く慣習もあるが
+    // 公式の基本配置に準拠し最終列に追加)
+    { num: 10, x: 0.0, row: 4 },
+  ];
+
+  layout.forEach((p) => {
+    const pin = createPinMesh(p.num);
+    const localPos = new THREE.Vector3(p.x, 0, -p.row * rowDepth);
+    localPos.applyQuaternion(quat);
+    localPos.add(pos);
+    pin.position.copy(localPos);
+    pin.quaternion.copy(quat);
+    pin.userData.basePosition = localPos.clone();
+    pin.userData.baseQuaternion = quat.clone();
+    pin.userData.knocked = false;
+    pin.userData.number = p.num;
+    scene.add(pin);
+    pins.push(pin);
+  });
+
+  pinsPlaced = true;
+  reticle.visible = false;
+  statusEl.textContent = 'スマホを振って棒を投げよう！';
+}
+
+function createNumberTexture(num) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 128;
+  canvas.height = 128;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#f5ecd7';
+  ctx.fillRect(0, 0, 128, 128);
+  ctx.strokeStyle = '#8a5a2b';
+  ctx.lineWidth = 6;
+  ctx.strokeRect(3, 3, 122, 122);
+  ctx.fillStyle = '#1a1a1a';
+  ctx.font = 'bold 64px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(String(num), 64, 68);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.needsUpdate = true;
+  return tex;
+}
+
+function createPinMesh(number) {
+  const group = new THREE.Group();
+
+  // 胴体(円柱)
+  const bodyHeight = 0.12;
+  const bodyGeo = new THREE.CylinderGeometry(0.018, 0.022, bodyHeight, 16, 1, true);
+  const bodyMat = new THREE.MeshStandardMaterial({ color: 0xe8d9b5 });
+  const body = new THREE.Mesh(bodyGeo, bodyMat);
+  body.position.y = bodyHeight / 2;
+  group.add(body);
+
+  // 頭部: 45度カットの切断面を表現する円錐台を斜めに使う
+  // シンプルに「上面を45度傾けた円柱」を頭部として配置し、
+  // その傾いた面に数字テクスチャを貼る
+  const headRadius = 0.022;
+  const headThickness = 0.03;
+  const headGeo = new THREE.CylinderGeometry(headRadius, headRadius, headThickness, 16);
+
+  const numberTex = createNumberTexture(number);
+  const sideMat = new THREE.MeshStandardMaterial({ color: 0xe8d9b5 });
+  const topMat = new THREE.MeshStandardMaterial({ map: numberTex });
+  const bottomMat = new THREE.MeshStandardMaterial({ color: 0xe8d9b5 });
+  // CylinderGeometryのマテリアル順: [側面, 上面, 底面]
+  const head = new THREE.Mesh(headGeo, [sideMat, topMat, bottomMat]);
+  head.position.y = bodyHeight + (headThickness / 2) * Math.cos(Math.PI / 4);
+  head.rotation.x = Math.PI / 4; // 45度傾ける → 切断面が斜め上向きになる
+  group.add(head);
+
+  group.userData.headTopDirection = new THREE.Vector3(0, Math.cos(Math.PI/4), Math.sin(Math.PI/4));
+
+  return group;
+}
+
+// ---------- 加速度センサーで棒を投げる ----------
+let lastAccelMagnitude = 0;
+let lastThrowTime = 0;
+const THROW_COOLDOWN = 700; // ms
+const SWING_THRESHOLD = 14; // m/s^2 の変化量しきい値（要調整）
+
+function setupMotionListener() {
+  function handleMotion(event) {
+    const acc = event.accelerationIncludingGravity || event.acceleration;
+    if (!acc) return;
+    const mag = Math.sqrt(
+      (acc.x || 0) ** 2 + (acc.y || 0) ** 2 + (acc.z || 0) ** 2
+    );
+    const delta = mag - lastAccelMagnitude;
+    lastAccelMagnitude = mag;
+
+    const now = performance.now();
+    if (delta > SWING_THRESHOLD && pinsPlaced && now - lastThrowTime > THROW_COOLDOWN) {
+      lastThrowTime = now;
+      const power = Math.min(delta / 25, 1.5); // 強弱を0~1.5にマッピング
+      throwStick(power);
+    }
+  }
+
+  if (typeof DeviceMotionEvent !== 'undefined' &&
+      typeof DeviceMotionEvent.requestPermission === 'function') {
+    // iOS Safari対応（念のため）
+    DeviceMotionEvent.requestPermission().then((res) => {
+      if (res === 'granted') {
+        window.addEventListener('devicemotion', handleMotion);
+      }
+    }).catch(() => {});
+  } else {
+    // Android Chromeはそのまま使える
+    window.addEventListener('devicemotion', handleMotion);
+  }
+}
+
+function throwStick(power) {
+  // モルックの投擲棒: 直径3cm程度、長さ20cm程度の木製円柱
+  const stickGeo = new THREE.CylinderGeometry(0.016, 0.016, 0.2, 12);
+  const stickMat = new THREE.MeshStandardMaterial({
+    color: 0xb5803c,
+    roughness: 0.8,
+  });
+  const stick = new THREE.Mesh(stickGeo, stickMat);
+
+  // カメラ位置・向きから発射
+  const camPos = new THREE.Vector3();
+  const camDir = new THREE.Vector3();
+  camera.getWorldPosition(camPos);
+  camera.getWorldDirection(camDir);
+
+  stick.position.copy(camPos).add(camDir.clone().multiplyScalar(0.35));
+  stick.quaternion.copy(camera.quaternion);
+  stick.rotateX(Math.PI / 2); // 円柱を進行方向に横向きに
+
+  const speed = 2.2 + power * 3.2; // 強弱を初速に反映
+  const velocity = camDir.clone().multiplyScalar(speed);
+  velocity.y += 0.25; // 軽い放物線
+
+  stick.userData.velocity = velocity;
+  stick.userData.gravity = -2.4;
+  stick.userData.life = 3.0; // 秒
+  stick.userData.spinAxis = new THREE.Vector3(1, 0.2, 0).normalize();
+  stick.userData.spinSpeed = 8 + power * 6; // ラジアン/秒
+
+  scene.add(stick);
+  sticks.push(stick);
+
+  statusEl.textContent = `投げた！ 強さ: ${(power * 100 / 1.5).toFixed(0)}%`;
+}
+
+// ---------- シンプルな衝突・転倒判定 ----------
+const PIN_RADIUS = 0.03;
+const KNOCK_SPEED_THRESHOLD = 0.4; // この速さ以上の衝突で倒れる
+
+function updateSticksAndCollisions(dt) {
+  for (let i = sticks.length - 1; i >= 0; i--) {
+    const s = sticks[i];
+    s.userData.life -= dt;
+    s.userData.velocity.y += s.userData.gravity * dt;
+    s.position.addScaledVector(s.userData.velocity, dt);
+    s.rotateOnAxis(s.userData.spinAxis, s.userData.spinSpeed * dt);
+
+    // このスティックがまだ「採点対象」かどうか（最初の着地/停止までの1投とみなす）
+    if (!s.userData.knockedThisThrow) s.userData.knockedThisThrow = [];
+
+    // ピンとの当たり判定（簡易：距離ベース）
+    for (const pin of pins) {
+      if (pin.userData.knocked) continue;
+      const pinHitPoint = pin.position.clone();
+      pinHitPoint.y += 0.06;
+      const d = s.position.distanceTo(pinHitPoint);
+      if (d < PIN_RADIUS + 0.045) {
+        const speed = s.userData.velocity.length();
+        if (speed > KNOCK_SPEED_THRESHOLD) {
+          knockPin(pin, s.userData.velocity);
+          s.userData.knockedThisThrow.push(pin.userData.number);
+        }
+      }
+    }
+
+    if (s.userData.life <= 0 || s.position.y < -2) {
+      // この投擲で倒れた本数をもとにスコア確定
+      finalizeThrow(s.userData.knockedThisThrow);
+      scene.remove(s);
+      sticks.splice(i, 1);
+    }
+  }
+
+  // 倒れたピンのアニメーション（簡易物理）
+  for (const pin of pins) {
+    if (!pin.userData.knocked) continue;
+    if (pin.userData.fallProgress === undefined) pin.userData.fallProgress = 0;
+    if (pin.userData.fallProgress < 1) {
+      pin.userData.fallProgress = Math.min(1, pin.userData.fallProgress + dt * 4);
+      const t = pin.userData.fallProgress;
+      pin.quaternion.copy(pin.userData.baseQuaternion).multiply(
+        new THREE.Quaternion().setFromAxisAngle(
+          pin.userData.fallAxis, t * Math.PI / 2
+        )
+      );
+      pin.position.y = pin.userData.basePosition.y - t * 0.04;
+    }
+  }
+}
+
+function knockPin(pin, velocity) {
+  pin.userData.knocked = true;
+  pin.userData.fallAxis = new THREE.Vector3(velocity.z, 0, -velocity.x).normalize();
+  if (pin.userData.fallAxis.lengthSq() === 0) {
+    pin.userData.fallAxis.set(1, 0, 0);
+  }
+}
+
+// モルック公式ルール:
+// ・1本だけ倒した場合 → そのピンの番号がそのまま得点
+// ・2本以上倒した場合 → 倒した本数が得点
+function finalizeThrow(knockedNumbers) {
+  if (!knockedNumbers || knockedNumbers.length === 0) {
+    lastThrowEl.textContent = '今回はピンに当たりませんでした';
+    return;
+  }
+  let points;
+  if (knockedNumbers.length === 1) {
+    points = knockedNumbers[0];
+    lastThrowEl.textContent = `${points}番ピンを倒した！ +${points}点`;
+  } else {
+    points = knockedNumbers.length;
+    lastThrowEl.textContent = `${knockedNumbers.length}本倒した！ +${points}点 (倒したピン: ${knockedNumbers.join(', ')})`;
+  }
+  score += points;
+  scoreEl.textContent = `合計スコア: ${score} 点`;
+
+  const remaining = pins.filter(p => !p.userData.knocked).length;
+  if (remaining === 0) {
+    statusEl.textContent = '🎉 全ピン撃破！リセットでもう一度';
+  } else if (score >= 50) {
+    statusEl.textContent = `🏆 50点到達！(${score}点) リセットでもう一度`;
+  } else {
+    statusEl.textContent = '次のスローを投げよう！';
+  }
+}
+
+// ---------- リセット ----------
+function resetGame() {
+  pins.forEach(p => scene.remove(p));
+  pins.length = 0;
+  sticks.forEach(s => scene.remove(s));
+  sticks.length = 0;
+  pinsPlaced = false;
+  score = 0;
+  scoreEl.textContent = `合計スコア: 0 点`;
+  lastThrowEl.textContent = '';
+  statusEl.textContent = '床をタップしてピンを配置してください';
+}
+
+// ---------- レンダーループ ----------
+const clock = new THREE.Clock();
+
+function render(timestamp, frame) {
+  const dt = Math.min(clock.getDelta(), 0.05);
+
+  if (frame) {
+    const referenceSpace = renderer.xr.getReferenceSpace();
+    const session = renderer.xr.getSession();
+
+    if (!hitTestSourceRequested) {
+      session.requestReferenceSpace('viewer').then((refSpace) => {
+        session.requestHitTestSource({ space: refSpace }).then((source) => {
+          hitTestSource = source;
+        });
+      });
+      session.addEventListener('end', () => {
+        hitTestSourceRequested = false;
+        hitTestSource = null;
+      });
+      hitTestSourceRequested = true;
+    }
+
+    if (hitTestSource && !pinsPlaced) {
+      const hitTestResults = frame.getHitTestResults(hitTestSource);
+      if (hitTestResults.length > 0) {
+        const hit = hitTestResults[0];
+        const pose = hit.getPose(referenceSpace);
+        reticle.visible = true;
+        reticle.matrix.fromArray(pose.transform.matrix);
+      } else {
+        reticle.visible = false;
+      }
+    }
+  }
+
+  updateSticksAndCollisions(dt);
+
+  renderer.render(scene, camera);
+}
+</script>
+</body>
+</html>
